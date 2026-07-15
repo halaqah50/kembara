@@ -1,0 +1,6 @@
+{
+  "name": "Kesiapan KEMBARA CM3105",
+  "description": "Dashboard monitoring kesiapan personal dan regu KEMBARA CM3105 Kemah Bela Negara terintegrasi dengan Google Sheets.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
