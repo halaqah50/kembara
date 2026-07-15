@@ -29,6 +29,16 @@ import {
   FileText
 } from "lucide-react";
 import { IndividualItem, TeamItem, MEMBERS, MemberName, INDIVIDUAL_ITEMS_TEMPLATE, TEAM_ITEMS_TEMPLATE } from "./types";
+import { 
+  getAppsScriptUrl, 
+  setAppsScriptUrl, 
+  isSheetsConnected, 
+  readSheetsData, 
+  updateIndividualItemOnSheet, 
+  updateTeamItemOnSheet, 
+  initializeSheetsOnSpreadsheet,
+  getGeneratedAppsScriptCode 
+} from "./lib/googleApi";
 import MemberReadiness from "./components/MemberReadiness";
 import TeamReadiness from "./components/TeamReadiness";
 
@@ -47,7 +57,7 @@ export default function App() {
   const [loginError, setLoginError] = useState<string | null>(null);
 
   // Sheets data states
-  const [spreadsheetId, setSpreadsheetId] = useState<string | null>(null);
+  const [spreadsheetId, setSpreadsheetId] = useState<string | null>("1JVHphy4wCj-NwrxeYNLPecXHat9c7mozGf8DkOaryRQ");
   const [individualItems, setIndividualItems] = useState<IndividualItem[]>([]);
   const [teamItems, setTeamItems] = useState<TeamItem[]>([]);
   
@@ -65,12 +75,17 @@ export default function App() {
   // App Script Config Drawer Toggles
   const [showConfig, setShowConfig] = useState(false);
   const [copiedScript, setCopiedScript] = useState(false);
+  const [appsScriptUrlInput, setAppsScriptUrlInput] = useState<string>("");
+  const [isInitializingSheet, setIsInitializingSheet] = useState(false);
 
   // Technical guide modal
   const [showTechnicalGuide, setShowTechnicalGuide] = useState(false);
 
   // Initialize Auth on mount
   useEffect(() => {
+    const savedUrl = getAppsScriptUrl() || "";
+    setAppsScriptUrlInput(savedUrl);
+
     const isLoggedIn = localStorage.getItem("kembara_logged_in") === "true";
     if (isLoggedIn) {
       setUser({
@@ -79,7 +94,7 @@ export default function App() {
         role: "Regu"
       });
       setNeedsAuth(false);
-      loadLocalData();
+      loadAllData();
     } else {
       setNeedsAuth(true);
     }
@@ -88,14 +103,42 @@ export default function App() {
     setLastSyncedTime(now.toTimeString().split(' ')[0]);
   }, []);
 
-  const loadLocalData = () => {
+  // Periodic background polling if Apps Script is configured
+  useEffect(() => {
+    if (needsAuth || !user) return;
+    const interval = setInterval(() => {
+      const url = getAppsScriptUrl();
+      if (url) {
+        readSheetsData(url).then(({ individualData, teamData }) => {
+          if (individualData.length > 0) {
+            setIndividualItems(individualData);
+            localStorage.setItem("kembara_individual_items", JSON.stringify(individualData));
+          }
+          if (teamData.length > 0) {
+            setTeamItems(teamData);
+            localStorage.setItem("kembara_team_items", JSON.stringify(teamData));
+          }
+          setLastSyncedTime(new Date().toTimeString().split(' ')[0]);
+          setSyncStatus("synced");
+        }).catch(err => {
+          console.warn("Background auto-sync failed:", err);
+        });
+      }
+    }, 30000); // Sync silently every 30 seconds
+    return () => clearInterval(interval);
+  }, [needsAuth, user]);
+
+  const loadAllData = async () => {
     setIsLoadingData(true);
     setError(null);
     try {
-      // 1. Individual Items
+      // 1. First load from local storage instantly for instant responsive UI
+      let localInd: IndividualItem[] = [];
+      let localTeam: TeamItem[] = [];
+
       const storedIndividual = localStorage.getItem("kembara_individual_items");
       if (storedIndividual) {
-        setIndividualItems(JSON.parse(storedIndividual));
+        localInd = JSON.parse(storedIndividual);
       } else {
         // Initialize default individual items for ALL 6 MEMBERS
         const defaultIndItems: IndividualItem[] = [];
@@ -114,14 +157,14 @@ export default function App() {
             });
           });
         });
-        setIndividualItems(defaultIndItems);
+        localInd = defaultIndItems;
         localStorage.setItem("kembara_individual_items", JSON.stringify(defaultIndItems));
       }
+      setIndividualItems(localInd);
 
-      // 2. Team Items
       const storedTeam = localStorage.getItem("kembara_team_items");
       if (storedTeam) {
-        setTeamItems(JSON.parse(storedTeam));
+        localTeam = JSON.parse(storedTeam);
       } else {
         const defaultTeamItems: TeamItem[] = TEAM_ITEMS_TEMPLATE.map((template, idx) => ({
           itemName: template.itemName,
@@ -131,22 +174,42 @@ export default function App() {
           lastUpdated: "",
           rowIndex: idx + 2
         }));
-        setTeamItems(defaultTeamItems);
+        localTeam = defaultTeamItems;
         localStorage.setItem("kembara_team_items", JSON.stringify(defaultTeamItems));
       }
+      
       setSyncStatus("synced");
       setLastSyncedTime(new Date().toTimeString().split(' ')[0]);
-    } catch (err) {
-      console.error("Failed to load local data:", err);
-      setError("Gagal memuat data lokal.");
+
+      // 2. If Google Sheets Apps Script is connected, sync from live Sheets!
+      const url = getAppsScriptUrl();
+      if (url) {
+        setSyncStatus("syncing");
+        const { individualData, teamData } = await readSheetsData(url);
+        
+        if (individualData && individualData.length > 0) {
+          setIndividualItems(individualData);
+          localStorage.setItem("kembara_individual_items", JSON.stringify(individualData));
+        }
+        if (teamData && teamData.length > 0) {
+          setTeamItems(teamData);
+          localStorage.setItem("kembara_team_items", JSON.stringify(teamData));
+        }
+        setSyncStatus("synced");
+        setLastSyncedTime(new Date().toTimeString().split(' ')[0]);
+      }
+    } catch (err: any) {
+      console.error("Live sync failed on load:", err);
+      setError("Gagal menyinkronkan dengan Google Sheets (Live). Menggunakan data lokal.");
+      setSyncStatus("error");
     } finally {
       setIsLoadingData(false);
     }
   };
 
-  // Keep loadSpreadsheetData as an alias for compatibility with refresh buttons
+  // Compatibility alias
   const loadSpreadsheetData = () => {
-    loadLocalData();
+    loadAllData();
   };
 
   const handleLogin = async (e?: React.FormEvent) => {
@@ -167,48 +230,8 @@ export default function App() {
       });
       setNeedsAuth(false);
       
-      // Load data
-      const storedIndividual = localStorage.getItem("kembara_individual_items");
-      const storedTeam = localStorage.getItem("kembara_team_items");
-      if (storedIndividual) {
-        setIndividualItems(JSON.parse(storedIndividual));
-      } else {
-        const defaultIndItems: IndividualItem[] = [];
-        let indexCounter = 2;
-        MEMBERS.forEach(member => {
-          INDIVIDUAL_ITEMS_TEMPLATE.forEach(template => {
-            defaultIndItems.push({
-              user: member,
-              category: template.category,
-              subcategory: template.subcategory,
-              itemName: template.itemName,
-              status: false,
-              notes: "",
-              lastUpdated: "",
-              rowIndex: indexCounter++
-            });
-          });
-        });
-        setIndividualItems(defaultIndItems);
-        localStorage.setItem("kembara_individual_items", JSON.stringify(defaultIndItems));
-      }
-
-      if (storedTeam) {
-        setTeamItems(JSON.parse(storedTeam));
-      } else {
-        const defaultTeamItems: TeamItem[] = TEAM_ITEMS_TEMPLATE.map((template, idx) => ({
-          itemName: template.itemName,
-          status: false,
-          pic: "Belum Ada",
-          notes: template.notes,
-          lastUpdated: "",
-          rowIndex: idx + 2
-        }));
-        setTeamItems(defaultTeamItems);
-        localStorage.setItem("kembara_team_items", JSON.stringify(defaultTeamItems));
-      }
-      setSyncStatus("synced");
-      setLastSyncedTime(new Date().toTimeString().split(' ')[0]);
+      // Load and sync data
+      await loadAllData();
     } else {
       setLoginError("Username atau Password salah!");
     }
@@ -228,18 +251,31 @@ export default function App() {
     const itemKey = `${updatedItem.user}-${updatedItem.itemName}`;
     setUpdatingItemId(itemKey);
     setSyncStatus("syncing");
-    try {
-      const newItems = individualItems.map(item => 
-        (item.user === updatedItem.user && item.itemName === updatedItem.itemName) ? updatedItem : item
-      );
-      setIndividualItems(newItems);
-      localStorage.setItem("kembara_individual_items", JSON.stringify(newItems));
+    
+    // 1. Optimistic update
+    const newItems = individualItems.map(item => 
+      (item.user === updatedItem.user && item.itemName === updatedItem.itemName) ? updatedItem : item
+    );
+    setIndividualItems(newItems);
+    localStorage.setItem("kembara_individual_items", JSON.stringify(newItems));
+    
+    // 2. Background push
+    const url = getAppsScriptUrl();
+    if (url) {
+      try {
+        await updateIndividualItemOnSheet(url, updatedItem);
+        setSyncStatus("synced");
+        setLastSyncedTime(new Date().toTimeString().split(' ')[0]);
+      } catch (err) {
+        console.error("Failed to sync individual item:", err);
+        setError("Gagal memperbarui data ke Google Sheet. Perubahan tersimpan secara lokal.");
+        setSyncStatus("error");
+      } finally {
+        setUpdatingItemId(null);
+      }
+    } else {
       setSyncStatus("synced");
       setLastSyncedTime(new Date().toTimeString().split(' ')[0]);
-    } catch (err) {
-      console.error("Failed to update individual item:", err);
-      setSyncStatus("error");
-    } finally {
       setUpdatingItemId(null);
     }
   };
@@ -248,18 +284,31 @@ export default function App() {
   const handleUpdateTeamItem = async (updatedItem: TeamItem) => {
     setUpdatingItemId(updatedItem.itemName);
     setSyncStatus("syncing");
-    try {
-      const newItems = teamItems.map(item => 
-        item.itemName === updatedItem.itemName ? updatedItem : item
-      );
-      setTeamItems(newItems);
-      localStorage.setItem("kembara_team_items", JSON.stringify(newItems));
+    
+    // 1. Optimistic update
+    const newItems = teamItems.map(item => 
+      item.itemName === updatedItem.itemName ? updatedItem : item
+    );
+    setTeamItems(newItems);
+    localStorage.setItem("kembara_team_items", JSON.stringify(newItems));
+
+    // 2. Background push
+    const url = getAppsScriptUrl();
+    if (url) {
+      try {
+        await updateTeamItemOnSheet(url, updatedItem);
+        setSyncStatus("synced");
+        setLastSyncedTime(new Date().toTimeString().split(' ')[0]);
+      } catch (err) {
+        console.error("Failed to sync team item:", err);
+        setError("Gagal memperbarui data ke Google Sheet. Perubahan tersimpan secara lokal.");
+        setSyncStatus("error");
+      } finally {
+        setUpdatingItemId(null);
+      }
+    } else {
       setSyncStatus("synced");
       setLastSyncedTime(new Date().toTimeString().split(' ')[0]);
-    } catch (err) {
-      console.error("Failed to update team item:", err);
-      setSyncStatus("error");
-    } finally {
       setUpdatingItemId(null);
     }
   };
@@ -915,38 +964,242 @@ function onEdit(e) {
         )}
       </AnimatePresence>
 
-      {/* 5. BOTTOM LOCAL STORAGE STATUS FOOTER */}
-      <footer className="fixed bottom-0 left-0 right-0 z-40 bg-[#0a1023] border-t border-slate-800 text-white shadow-xl px-4 md:px-8 py-3.5">
-        <div className="max-w-7xl mx-auto flex flex-col sm:flex-row items-center justify-between gap-3">
-          <div className="flex items-center space-x-2">
-            <div className="w-8 h-8 bg-emerald-900/40 rounded-xl flex items-center justify-center border border-emerald-700/20">
-              <CheckCircle className="w-4 h-4 text-emerald-400" />
-            </div>
-            <div>
-              <span className="text-xs font-sans font-bold text-white tracking-wide block">
-                Sistem Penyimpanan Lokal Aktif
-              </span>
-              <p className="text-[10px] text-slate-400 font-sans">
-                Seluruh pembaruan checklist disimpan secara otomatis di peramban (browser) perangkat ini.
+      {/* 5. BOTTOM GOOGLE SHEETS SYNC CONTROL FOOTER */}
+      <footer className="fixed bottom-0 left-0 right-0 z-40 bg-[#070d1e] border-t border-slate-800 text-white shadow-2xl px-4 md:px-8 py-3.5 transition-all">
+        <div className="max-w-7xl mx-auto flex flex-col md:flex-row items-center justify-between gap-4">
+          
+          {/* Connection Status Indicator */}
+          <div className="flex items-center space-x-3 w-full md:w-auto">
+            {isSheetsConnected() ? (
+              <div className="w-8 h-8 bg-emerald-950 border border-emerald-500/30 rounded-xl flex items-center justify-center">
+                <CheckCircle className="w-4 h-4 text-emerald-400" />
+              </div>
+            ) : (
+              <div className="w-8 h-8 bg-slate-900 border border-slate-700/30 rounded-xl flex items-center justify-center">
+                <FileSpreadsheet className="w-4 h-4 text-slate-400" />
+              </div>
+            )}
+            <div className="text-left">
+              <div className="flex items-center space-x-2">
+                <span className="text-xs font-sans font-extrabold text-white tracking-wide">
+                  {isSheetsConnected() ? "Sinkronisasi Google Sheets Aktif" : "Sistem Penyimpanan Lokal"}
+                </span>
+                <span className={`text-[9px] font-extrabold px-2 py-0.5 rounded-full uppercase tracking-wider font-mono ${
+                  isSheetsConnected() 
+                    ? "bg-emerald-950 border border-emerald-500/20 text-emerald-400" 
+                    : "bg-slate-900 border border-slate-700/20 text-slate-400"
+                }`}>
+                  {isSheetsConnected() ? "Live" : "Lokal"}
+                </span>
+              </div>
+              <p className="text-[10px] text-slate-400 font-sans mt-0.5">
+                {isSheetsConnected() 
+                  ? "Status kesiapan disinkronkan secara real-time dengan spreadsheet Google."
+                  : "Perubahan disimpan di browser ini. Hubungkan Google Sheets untuk kerja kelompok."
+                }
               </p>
             </div>
           </div>
-          
-          <div className="flex items-center space-x-2">
+
+          {/* Quick Buttons */}
+          <div className="flex items-center space-x-2.5 w-full md:w-auto justify-end">
+            <button
+              onClick={() => setShowConfig(!showConfig)}
+              className={`px-3.5 py-1.5 rounded-xl text-xs font-bold transition-all flex items-center space-x-1.5 cursor-pointer ${
+                showConfig 
+                  ? "bg-blue-600 text-white shadow-md shadow-blue-600/10" 
+                  : "bg-slate-900 hover:bg-slate-800 text-slate-300 border border-slate-850"
+              }`}
+            >
+              <FileSpreadsheet className="w-3.5 h-3.5" />
+              <span>{showConfig ? "Tutup Pengaturan" : "Konfigurasi Google Sheets"}</span>
+            </button>
+
             <button
               onClick={() => {
                 if (window.confirm("Apakah Anda yakin ingin mengatur ulang semua data checklist kembali ke setelan awal? Tindakan ini tidak dapat dibatalkan.")) {
                   localStorage.removeItem("kembara_individual_items");
                   localStorage.removeItem("kembara_team_items");
-                  loadLocalData();
+                  loadAllData();
                 }
               }}
-              className="px-3.5 py-1.5 bg-red-950/40 hover:bg-red-900/60 text-red-300 hover:text-white rounded-xl border border-red-900/30 text-xs font-bold transition-all cursor-pointer"
+              className="px-3 py-1.5 bg-red-950/20 hover:bg-red-900/30 text-red-400 hover:text-red-300 rounded-xl border border-red-900/20 text-xs font-bold transition-all cursor-pointer"
             >
-              Atur Ulang Data
+              Atur Ulang
             </button>
           </div>
         </div>
+
+        {/* Toggled Settings & Integration Drawer */}
+        <AnimatePresence>
+          {showConfig && (
+            <motion.div
+              initial={{ opacity: 0, height: 0 }}
+              animate={{ opacity: 1, height: "auto" }}
+              exit={{ opacity: 0, height: 0 }}
+              className="max-w-7xl mx-auto overflow-hidden mt-4 pt-4 border-t border-slate-800"
+            >
+              <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 text-xs text-slate-300 pb-4">
+                
+                {/* Form to connect Web App URL */}
+                <div className="lg:col-span-5 space-y-4 bg-slate-950/50 p-5 rounded-2xl border border-slate-850/60 flex flex-col justify-between">
+                  <div className="space-y-3">
+                    <h4 className="font-extrabold text-[#00d2ff] uppercase font-mono tracking-wider text-[10px] flex items-center">
+                      <span className="w-1.5 h-1.5 bg-[#00d2ff] rounded-full mr-2 animate-pulse" />
+                      1. Hubungkan Google Apps Script Web App
+                    </h4>
+                    <p className="text-slate-400 leading-relaxed text-[11px]">
+                      Tempel URL Web App dari Google Apps Script yang Anda deploy di Google Sheet Anda untuk mengaktifkan database real-time.
+                    </p>
+
+                    <div className="space-y-1.5">
+                      <label className="block text-[10px] font-bold text-slate-500 uppercase tracking-wider font-mono">
+                        URL Web App Apps Script:
+                      </label>
+                      <input
+                        type="url"
+                        value={appsScriptUrlInput}
+                        onChange={(e) => setAppsScriptUrlInput(e.target.value)}
+                        placeholder="https://script.google.com/macros/s/xxxxxxxx/exec"
+                        className="w-full bg-slate-900 border border-slate-800 hover:border-slate-700 focus:border-blue-500 focus:bg-slate-900/80 text-xs px-3.5 py-2.5 rounded-xl outline-none transition-all duration-200 text-white font-mono"
+                      />
+                    </div>
+                  </div>
+
+                  <div className="flex flex-col sm:flex-row gap-2 mt-4">
+                    <button
+                      onClick={() => {
+                        if (!appsScriptUrlInput.trim().startsWith("https://script.google.com/")) {
+                          alert("Harap masukkan URL Google Apps Script Web App yang valid.");
+                          return;
+                        }
+                        setAppsScriptUrl(appsScriptUrlInput);
+                        loadAllData();
+                      }}
+                      className="flex-1 bg-blue-600 hover:bg-blue-700 text-white font-sans font-bold text-xs py-2.5 rounded-xl shadow-md transition-all flex items-center justify-center space-x-1.5 cursor-pointer"
+                    >
+                      <Check className="w-4 h-4" />
+                      <span>Simpan & Sambungkan</span>
+                    </button>
+
+                    {isSheetsConnected() && (
+                      <button
+                        onClick={() => {
+                          if (window.confirm("Putuskan koneksi dari Google Sheets dan kembali ke penyimpanan lokal?")) {
+                            setAppsScriptUrl("");
+                            setAppsScriptUrlInput("");
+                            loadAllData();
+                          }
+                        }}
+                        className="px-3.5 py-2.5 bg-slate-900 hover:bg-slate-850 text-slate-400 hover:text-white rounded-xl border border-slate-800 text-xs font-bold transition-all cursor-pointer"
+                      >
+                        Putuskan
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                {/* Automation Seeding / Init Control if connected */}
+                <div className="lg:col-span-7 space-y-4 bg-slate-950/50 p-5 rounded-2xl border border-slate-850/60">
+                  <h4 className="font-extrabold text-[#00d2ff] uppercase font-mono tracking-wider text-[10px] flex items-center justify-between">
+                    <span>2. Setup & Sinkronisasi Spreadsheet</span>
+                    {isSheetsConnected() && (
+                      <span className="text-emerald-400 font-sans font-bold text-[10px] bg-emerald-950/80 px-2 py-0.5 rounded-full border border-emerald-800/40">
+                        SINKRON
+                      </span>
+                    )}
+                  </h4>
+
+                  <div className="space-y-3">
+                    <div className="bg-slate-900 p-3 rounded-xl border border-slate-800/80 text-[11px] text-slate-300">
+                      <p className="font-bold text-white mb-1">Target Google Sheets:</p>
+                      <a 
+                        href="https://docs.google.com/spreadsheets/d/1JVHphy4wCj-NwrxeYNLPecXHat9c7mozGf8DkOaryRQ/edit?usp=sharing"
+                        target="_blank" 
+                        rel="noreferrer" 
+                        className="text-[#00d2ff] underline font-mono break-all hover:text-blue-400 flex items-center space-x-1"
+                      >
+                        <span>https://docs.google.com/spreadsheets/d/1JVHphy4wCj-NwrxeYNLPecXHat9c7mozGf8DkOaryRQ/...</span>
+                        <ExternalLink className="w-3 h-3 inline flex-shrink-0" />
+                      </a>
+                    </div>
+
+                    <div className="space-y-2">
+                      <p className="text-slate-400 leading-relaxed text-[11px]">
+                        Gunakan tombol di bawah ini untuk menginisialisasi atau mengatur ulang struktur kolom tab <strong className="text-white">"Individu"</strong> dan <strong className="text-white">"Regu"</strong> langsung di Google Sheets Anda secara otomatis jika sheet Anda masih kosong.
+                      </p>
+
+                      <div className="flex flex-col sm:flex-row gap-2.5">
+                        <button
+                          disabled={!isSheetsConnected() || isInitializingSheet}
+                          onClick={async () => {
+                            if (!window.confirm("Tindakan ini akan membuat/mengatur ulang tab 'Individu' dan 'Regu' di Google Sheet Target Anda. Seluruh data di sheet tersebut akan digantikan dengan template default Kembara. Apakah Anda yakin ingin melanjutkan?")) {
+                              return;
+                            }
+                            setIsInitializingSheet(true);
+                            setError(null);
+                            try {
+                              const url = getAppsScriptUrl();
+                              if (url) {
+                                await initializeSheetsOnSpreadsheet(url);
+                                alert("Berhasil menginisialisasi Google Sheet! Tab 'Individu' dan 'Regu' telah dibuat & diisi.");
+                                loadAllData();
+                              }
+                            } catch (err: any) {
+                              console.error("Failed to initialize sheet:", err);
+                              alert("Gagal menginisialisasi Google Sheet: " + (err.message || err));
+                            } finally {
+                              setIsInitializingSheet(false);
+                            }
+                          }}
+                          className={`flex-1 font-sans font-bold text-xs py-2.5 rounded-xl shadow-md transition-all flex items-center justify-center space-x-1.5 ${
+                            isSheetsConnected() 
+                              ? "bg-amber-600 hover:bg-amber-700 text-white cursor-pointer" 
+                              : "bg-slate-900 text-slate-500 border border-slate-850 cursor-not-allowed"
+                          }`}
+                        >
+                          {isInitializingSheet ? (
+                            <>
+                              <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                              <span>Menginisialisasi Kolom...</span>
+                            </>
+                          ) : (
+                            <>
+                              <PlusCircle className="w-3.5 h-3.5" />
+                              <span>Inisialisasi Struktur Google Sheet</span>
+                            </>
+                          )}
+                        </button>
+
+                        <button
+                          onClick={() => {
+                            const code = getGeneratedAppsScriptCode("1JVHphy4wCj-NwrxeYNLPecXHat9c7mozGf8DkOaryRQ");
+                            navigator.clipboard.writeText(code);
+                            setCopiedScript(true);
+                            setTimeout(() => setCopiedScript(false), 2000);
+                          }}
+                          className="px-4 py-2.5 bg-slate-900 hover:bg-slate-850 text-slate-200 hover:text-white rounded-xl border border-slate-800 text-xs font-bold transition-all flex items-center justify-center space-x-1.5 cursor-pointer"
+                        >
+                          {copiedScript ? <Check className="w-4 h-4 text-emerald-400" /> : <Copy className="w-4 h-4" />}
+                          <span>{copiedScript ? "Kode Tersalin!" : "Salin Kode Apps Script"}</span>
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="pt-2 text-[10px] text-slate-400 leading-relaxed space-y-1">
+                      <p className="font-extrabold text-slate-300">Cara Penggunaan (3 Langkah Cepat):</p>
+                      <p>1. Klik <strong className="text-white">"Salin Kode Apps Script"</strong> di atas.</p>
+                      <p>2. Buka spreadsheet Anda, klik <strong className="text-white">Ekstensi &rarr; Apps Script</strong>, hapus kode bawaan, tempel kode tadi, klik simpan.</p>
+                      <p>3. Klik <strong className="text-white">Terapkan (Deploy) &rarr; Penerapan baru</strong>, pilih <strong className="text-white">Aplikasi Web</strong>, set Akses ke <strong className="text-white">"Siapa saja" (Anyone)</strong>, klik Terapkan, salin URL-nya dan tempel di formulir di kiri.</p>
+                    </div>
+
+                  </div>
+                </div>
+
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
       </footer>
 
       {/* Floating Synced Timestamp Indicator (Matches far bottom right) */}
