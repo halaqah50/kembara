@@ -4,6 +4,7 @@
  */
 
 import React, { useState, useEffect } from "react";
+import { User } from "firebase/auth";
 import { motion, AnimatePresence } from "motion/react";
 import { 
   Tent, 
@@ -28,36 +29,27 @@ import {
   ChevronRight,
   FileText
 } from "lucide-react";
-import { IndividualItem, TeamItem, MEMBERS, MemberName, INDIVIDUAL_ITEMS_TEMPLATE, TEAM_ITEMS_TEMPLATE } from "./types";
+import { initAuth, googleSignIn, logout } from "./lib/firebase";
 import { 
-  getAppsScriptUrl, 
-  setAppsScriptUrl, 
-  isSheetsConnected, 
-  readSheetsData, 
-  updateIndividualItemOnSheet, 
-  updateTeamItemOnSheet, 
-  initializeSheetsOnSpreadsheet,
-  getGeneratedAppsScriptCode 
+  findSpreadsheet, 
+  createAndInitializeSpreadsheet, 
+  readIndividualItems, 
+  readTeamItems, 
+  updateIndividualItem, 
+  updateTeamItem 
 } from "./lib/googleApi";
+import { IndividualItem, TeamItem, MEMBERS, MemberName } from "./types";
 import MemberReadiness from "./components/MemberReadiness";
 import TeamReadiness from "./components/TeamReadiness";
 
-interface LocalUser {
-  username: string;
-  displayName: string;
-  role: string;
-}
-
 export default function App() {
-  const [user, setUser] = useState<LocalUser | null>(null);
-  const [needsAuth, setNeedsAuth] = useState(true);
-  const [usernameInput, setUsernameInput] = useState("");
-  const [passwordInput, setPasswordInput] = useState("");
+  const [user, setUser] = useState<User | null>(null);
+  const [token, setToken] = useState<string | null>(null);
+  const [needsAuth, setNeedsAuth] = useState(false);
   const [isLoggingIn, setIsLoggingIn] = useState(false);
-  const [loginError, setLoginError] = useState<string | null>(null);
 
   // Sheets data states
-  const [spreadsheetId, setSpreadsheetId] = useState<string | null>("1JVHphy4wCj-NwrxeYNLPecXHat9c7mozGf8DkOaryRQ");
+  const [spreadsheetId, setSpreadsheetId] = useState<string | null>(null);
   const [individualItems, setIndividualItems] = useState<IndividualItem[]>([]);
   const [teamItems, setTeamItems] = useState<TeamItem[]>([]);
   
@@ -75,240 +67,183 @@ export default function App() {
   // App Script Config Drawer Toggles
   const [showConfig, setShowConfig] = useState(false);
   const [copiedScript, setCopiedScript] = useState(false);
-  const [appsScriptUrlInput, setAppsScriptUrlInput] = useState<string>("");
-  const [isInitializingSheet, setIsInitializingSheet] = useState(false);
 
   // Technical guide modal
   const [showTechnicalGuide, setShowTechnicalGuide] = useState(false);
 
-  // Initialize Auth on mount
+  // Initialize Auth
   useEffect(() => {
-    const savedUrl = getAppsScriptUrl() || "";
-    setAppsScriptUrlInput(savedUrl);
-
-    const isLoggedIn = localStorage.getItem("kembara_logged_in") === "true";
-    if (isLoggedIn) {
-      setUser({
-        username: "cm3105",
-        displayName: "CM3105 Member",
-        role: "Regu"
-      });
-      setNeedsAuth(false);
-      loadAllData();
-    } else {
-      setNeedsAuth(true);
-    }
+    initAuth(
+      (currentUser, cachedToken) => {
+        setUser(currentUser);
+        setToken(cachedToken);
+        setNeedsAuth(false);
+      },
+      () => {
+        setNeedsAuth(true);
+      }
+    );
     // Initialize synced timestamp
     const now = new Date();
     setLastSyncedTime(now.toTimeString().split(' ')[0]);
   }, []);
 
-  // Periodic background polling if Apps Script is configured
+  // Load spreadsheet data once token is available
   useEffect(() => {
-    if (needsAuth || !user) return;
-    const interval = setInterval(() => {
-      const url = getAppsScriptUrl();
-      if (url) {
-        readSheetsData(url).then(({ individualData, teamData }) => {
-          if (individualData.length > 0) {
-            setIndividualItems(individualData);
-            localStorage.setItem("kembara_individual_items", JSON.stringify(individualData));
-          }
-          if (teamData.length > 0) {
-            setTeamItems(teamData);
-            localStorage.setItem("kembara_team_items", JSON.stringify(teamData));
-          }
-          setLastSyncedTime(new Date().toTimeString().split(' ')[0]);
-          setSyncStatus("synced");
-        }).catch(err => {
-          console.warn("Background auto-sync failed:", err);
-        });
-      }
-    }, 30000); // Sync silently every 30 seconds
-    return () => clearInterval(interval);
-  }, [needsAuth, user]);
+    if (token) {
+      loadSpreadsheetData();
+    }
+  }, [token]);
 
-  const loadAllData = async () => {
+  // Periodic polling simulation
+  useEffect(() => {
+    if (!token || !spreadsheetId) return;
+    const interval = setInterval(() => {
+      // Background sync quietly
+      silentSyncData();
+    }, 45000); // Poll every 45s
+    return () => clearInterval(interval);
+  }, [token, spreadsheetId]);
+
+  const loadSpreadsheetData = async () => {
+    if (!token) return;
     setIsLoadingData(true);
     setError(null);
     try {
-      // 1. First load from local storage instantly for instant responsive UI
-      let localInd: IndividualItem[] = [];
-      let localTeam: TeamItem[] = [];
-
-      const storedIndividual = localStorage.getItem("kembara_individual_items");
-      if (storedIndividual) {
-        localInd = JSON.parse(storedIndividual);
-      } else {
-        // Initialize default individual items for ALL 6 MEMBERS
-        const defaultIndItems: IndividualItem[] = [];
-        let indexCounter = 2;
-        MEMBERS.forEach(member => {
-          INDIVIDUAL_ITEMS_TEMPLATE.forEach(template => {
-            defaultIndItems.push({
-              user: member,
-              category: template.category,
-              subcategory: template.subcategory,
-              itemName: template.itemName,
-              status: false,
-              notes: "",
-              lastUpdated: "",
-              rowIndex: indexCounter++
-            });
-          });
-        });
-        localInd = defaultIndItems;
-        localStorage.setItem("kembara_individual_items", JSON.stringify(defaultIndItems));
-      }
-      setIndividualItems(localInd);
-
-      const storedTeam = localStorage.getItem("kembara_team_items");
-      if (storedTeam) {
-        localTeam = JSON.parse(storedTeam);
-      } else {
-        const defaultTeamItems: TeamItem[] = TEAM_ITEMS_TEMPLATE.map((template, idx) => ({
-          itemName: template.itemName,
-          status: false,
-          pic: "Belum Ada",
-          notes: template.notes,
-          lastUpdated: "",
-          rowIndex: idx + 2
-        }));
-        localTeam = defaultTeamItems;
-        localStorage.setItem("kembara_team_items", JSON.stringify(defaultTeamItems));
-      }
-      
-      setSyncStatus("synced");
-      setLastSyncedTime(new Date().toTimeString().split(' ')[0]);
-
-      // 2. If Google Sheets Apps Script is connected, sync from live Sheets!
-      const url = getAppsScriptUrl();
-      if (url) {
-        setSyncStatus("syncing");
-        const { individualData, teamData } = await readSheetsData(url);
-        
-        if (individualData && individualData.length > 0) {
-          setIndividualItems(individualData);
-          localStorage.setItem("kembara_individual_items", JSON.stringify(individualData));
-        }
-        if (teamData && teamData.length > 0) {
-          setTeamItems(teamData);
-          localStorage.setItem("kembara_team_items", JSON.stringify(teamData));
-        }
+      const sheetId = await findSpreadsheet(token);
+      if (sheetId) {
+        setSpreadsheetId(sheetId);
+        const indItems = await readIndividualItems(token, sheetId);
+        const tItems = await readTeamItems(token, sheetId);
+        setIndividualItems(indItems);
+        setTeamItems(tItems);
         setSyncStatus("synced");
         setLastSyncedTime(new Date().toTimeString().split(' ')[0]);
+      } else {
+        setSpreadsheetId(null);
       }
     } catch (err: any) {
-      console.error("Live sync failed on load:", err);
-      setError(`Gagal menyinkronkan dengan Google Sheets (Live): ${err.message || "Pastikan koneksi internet aktif dan URL Apps Script benar"}. Menggunakan data lokal.`);
+      console.error("Failed to load spreadsheet data:", err);
+      setError("Gagal memuat data dari Google Drive. Pastikan Anda memberikan izin akses Google Sheets.");
       setSyncStatus("error");
     } finally {
       setIsLoadingData(false);
     }
   };
 
-  // Compatibility alias
-  const loadSpreadsheetData = () => {
-    loadAllData();
+  const silentSyncData = async () => {
+    if (!token || !spreadsheetId || isLoadingData) return;
+    setSyncStatus("syncing");
+    try {
+      const indItems = await readIndividualItems(token, spreadsheetId);
+      const tItems = await readTeamItems(token, spreadsheetId);
+      setIndividualItems(indItems);
+      setTeamItems(tItems);
+      setSyncStatus("synced");
+      setLastSyncedTime(new Date().toTimeString().split(' ')[0]);
+    } catch (err) {
+      console.error("Silent background sync failed:", err);
+      setSyncStatus("error");
+    }
   };
 
-  const handleLogin = async (e?: React.FormEvent) => {
-    if (e) e.preventDefault();
+  const handleLogin = async () => {
     setIsLoggingIn(true);
-    setLoginError(null);
     setError(null);
-    
-    // Artificial slight delay for organic feedback feel
-    await new Promise(resolve => setTimeout(resolve, 500));
-
-    if (usernameInput.trim() === "cm3105" && passwordInput === "kembara") {
-      localStorage.setItem("kembara_logged_in", "true");
-      setUser({
-        username: "cm3105",
-        displayName: "CM3105 Member",
-        role: "Regu"
-      });
-      setNeedsAuth(false);
-      
-      // Load and sync data
-      await loadAllData();
-    } else {
-      setLoginError("Username atau Password salah!");
+    try {
+      const result = await googleSignIn();
+      if (result) {
+        setToken(result.accessToken);
+        setUser(result.user);
+        setNeedsAuth(false);
+      }
+    } catch (err: any) {
+      console.error("Login failed:", err);
+      setError("Gagal masuk dengan Google. Silakan coba lagi.");
+      setNeedsAuth(true);
+    } finally {
+      setIsLoggingIn(false);
     }
-    setIsLoggingIn(false);
   };
 
   const handleLogout = async () => {
-    localStorage.removeItem("kembara_logged_in");
-    setUser(null);
-    setIndividualItems([]);
-    setTeamItems([]);
-    setNeedsAuth(true);
+    try {
+      await logout();
+      setUser(null);
+      setToken(null);
+      setSpreadsheetId(null);
+      setIndividualItems([]);
+      setTeamItems([]);
+      setNeedsAuth(true);
+    } catch (err) {
+      console.error("Sign out failed:", err);
+    }
+  };
+
+  const handleCreateSheet = async () => {
+    if (!token) return;
+    setInitializingSpreadsheet(true);
+    setError(null);
+    try {
+      const newSheetId = await createAndInitializeSpreadsheet(token);
+      setSpreadsheetId(newSheetId);
+      const indItems = await readIndividualItems(token, newSheetId);
+      const tItems = await readTeamItems(token, newSheetId);
+      setIndividualItems(indItems);
+      setTeamItems(tItems);
+      setSyncStatus("synced");
+      setLastSyncedTime(new Date().toTimeString().split(' ')[0]);
+    } catch (err: any) {
+      console.error("Failed to create sheet:", err);
+      setError("Gagal membuat spreadsheet baru di Google Drive Anda. Silakan coba kembali.");
+    } finally {
+      setInitializingSpreadsheet(false);
+    }
   };
 
   // Update handler for individual items
   const handleUpdateIndividualItem = async (updatedItem: IndividualItem) => {
+    if (!token || !spreadsheetId) return;
     const itemKey = `${updatedItem.user}-${updatedItem.itemName}`;
     setUpdatingItemId(itemKey);
     setSyncStatus("syncing");
-    
-    // 1. Optimistic update
-    const newItems = individualItems.map(item => 
-      (item.user === updatedItem.user && item.itemName === updatedItem.itemName) ? updatedItem : item
-    );
-    setIndividualItems(newItems);
-    localStorage.setItem("kembara_individual_items", JSON.stringify(newItems));
-    
-    // 2. Background push
-    const url = getAppsScriptUrl();
-    if (url) {
-      try {
-        await updateIndividualItemOnSheet(url, updatedItem);
-        setSyncStatus("synced");
-        setLastSyncedTime(new Date().toTimeString().split(' ')[0]);
-      } catch (err) {
-        console.error("Failed to sync individual item:", err);
-        setError("Gagal memperbarui data ke Google Sheet. Perubahan tersimpan secara lokal.");
-        setSyncStatus("error");
-      } finally {
-        setUpdatingItemId(null);
-      }
-    } else {
+    try {
+      // Optimistic update
+      setIndividualItems(prev => prev.map(item => 
+        (item.user === updatedItem.user && item.itemName === updatedItem.itemName) ? updatedItem : item
+      ));
+
+      await updateIndividualItem(token, spreadsheetId, updatedItem);
       setSyncStatus("synced");
       setLastSyncedTime(new Date().toTimeString().split(' ')[0]);
+    } catch (err) {
+      console.error("Failed to update individual item:", err);
+      setSyncStatus("error");
+      loadSpreadsheetData();
+    } finally {
       setUpdatingItemId(null);
     }
   };
 
   // Update handler for team items
   const handleUpdateTeamItem = async (updatedItem: TeamItem) => {
+    if (!token || !spreadsheetId) return;
     setUpdatingItemId(updatedItem.itemName);
     setSyncStatus("syncing");
-    
-    // 1. Optimistic update
-    const newItems = teamItems.map(item => 
-      item.itemName === updatedItem.itemName ? updatedItem : item
-    );
-    setTeamItems(newItems);
-    localStorage.setItem("kembara_team_items", JSON.stringify(newItems));
+    try {
+      // Optimistic update
+      setTeamItems(prev => prev.map(item => 
+        item.itemName === updatedItem.itemName ? updatedItem : item
+      ));
 
-    // 2. Background push
-    const url = getAppsScriptUrl();
-    if (url) {
-      try {
-        await updateTeamItemOnSheet(url, updatedItem);
-        setSyncStatus("synced");
-        setLastSyncedTime(new Date().toTimeString().split(' ')[0]);
-      } catch (err) {
-        console.error("Failed to sync team item:", err);
-        setError("Gagal memperbarui data ke Google Sheet. Perubahan tersimpan secara lokal.");
-        setSyncStatus("error");
-      } finally {
-        setUpdatingItemId(null);
-      }
-    } else {
+      await updateTeamItem(token, spreadsheetId, updatedItem);
       setSyncStatus("synced");
       setLastSyncedTime(new Date().toTimeString().split(' ')[0]);
+    } catch (err) {
+      console.error("Failed to update team item:", err);
+      setSyncStatus("error");
+      loadSpreadsheetData();
+    } finally {
       setUpdatingItemId(null);
     }
   };
@@ -386,86 +321,58 @@ function onEdit(e) {
             <Compass className="w-10 h-10 text-white animate-spin" style={{ animationDuration: "35s" }} />
           </div>
 
-          <div className="text-center mb-6">
-            <h1 className="text-3xl font-display font-extrabold tracking-tight text-slate-900">
+          <div className="text-center mb-8">
+            <h1 className="text-3xl font-display font-bold tracking-tight text-slate-900">
               KEMBARA MONITORING
             </h1>
-            <p className="text-sm font-sans text-blue-800 font-bold tracking-wide mt-2">
-              Kemah Bela Negara • Regu CM3105
+            <p className="text-sm font-sans text-blue-800 font-medium mt-2">
+              Kemah Bela Negara Readiness Group CM3105
             </p>
           </div>
 
-          <div className="bg-white border border-slate-200/80 p-8 rounded-3xl w-full shadow-xl shadow-slate-200/40">
-            <h3 className="text-lg font-sans font-extrabold text-slate-800 mb-2 text-center">
-              Akses Log Masuk
-            </h3>
-            <p className="text-slate-500 text-xs text-center mb-6 leading-relaxed">
-              Silakan masukkan Username dan Password Anda untuk memantau dan mengelola kesiapan perlengkapan.
+          <div className="bg-white border border-slate-200 p-8 rounded-2xl w-full text-center shadow-xl shadow-slate-200/50">
+            <p className="text-slate-600 text-sm leading-relaxed mb-6 font-sans">
+              Silakan masuk dengan Akun Google Anda untuk mengakses, memperbarui, dan memantau checklist kesiapan personal dan regu secara real-time.
             </p>
 
-            <form onSubmit={handleLogin} className="space-y-4">
-              <div>
-                <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-1.5 font-mono">
-                  Username
-                </label>
-                <input
-                  type="text"
-                  value={usernameInput}
-                  onChange={(e) => setUsernameInput(e.target.value)}
-                  placeholder="Masukkan username"
-                  required
-                  className="w-full bg-slate-50 border border-slate-200 hover:border-slate-300 focus:border-blue-500 focus:bg-white text-sm px-4 py-3 rounded-xl outline-none transition-all duration-200"
-                />
-              </div>
-
-              <div>
-                <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-1.5 font-mono">
-                  Password
-                </label>
-                <input
-                  type="password"
-                  value={passwordInput}
-                  onChange={(e) => setPasswordInput(e.target.value)}
-                  placeholder="••••••••"
-                  required
-                  className="w-full bg-slate-50 border border-slate-200 hover:border-slate-300 focus:border-blue-500 focus:bg-white text-sm px-4 py-3 rounded-xl outline-none transition-all duration-200"
-                />
-              </div>
-
-              {loginError && (
-                <div className="p-3.5 rounded-xl bg-red-50 border border-red-200 text-red-700 text-xs flex items-center space-x-2">
-                  <AlertCircle className="w-4 h-4 flex-shrink-0 text-red-600" />
-                  <span className="font-semibold text-left">{loginError}</span>
-                </div>
-              )}
-
-              <button
-                type="submit"
+            <div className="flex justify-center">
+              <button 
+                onClick={handleLogin} 
                 disabled={isLoggingIn}
-                className="w-full bg-[#0B1530] hover:bg-blue-900 active:scale-[0.99] text-white font-sans font-bold text-sm py-3.5 rounded-xl shadow-md transition-all duration-200 flex items-center justify-center space-x-2 cursor-pointer mt-2"
+                className="gsi-material-button w-full shadow-md shadow-slate-200/60 hover:scale-[1.01] active:scale-[0.99] transition-all border border-slate-300"
+                id="google-signin-btn"
               >
-                {isLoggingIn ? (
-                  <>
-                    <RefreshCw className="w-4 h-4 animate-spin text-white/80" />
-                    <span>Memproses Masuk...</span>
-                  </>
-                ) : (
-                  <>
-                    <span>Masuk Ke Dashboard</span>
-                    <ArrowRight className="w-4 h-4" />
-                  </>
-                )}
+                <div className="gsi-material-button-state"></div>
+                <div className="gsi-material-button-content-wrapper">
+                  <div className="gsi-material-button-icon">
+                    <svg version="1.1" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" style={{ display: "block" }}>
+                      <path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"></path>
+                      <path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"></path>
+                      <path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"></path>
+                      <path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"></path>
+                      <path fill="none" d="M0 0h48v48H0z"></path>
+                    </svg>
+                  </div>
+                  <span className="gsi-material-button-contents font-sans">
+                    {isLoggingIn ? "Menghubungkan..." : "Masuk dengan Google"}
+                  </span>
+                </div>
               </button>
-            </form>
+            </div>
 
-
+            {error && (
+              <div className="mt-4 p-3 rounded-lg bg-red-50 border border-red-200 text-red-700 text-xs flex items-center space-x-2">
+                <AlertCircle className="w-4 h-4 flex-shrink-0 text-red-600" />
+                <span className="font-medium text-left">{error}</span>
+              </div>
+            )}
           </div>
 
-          <div className="mt-6 text-center text-xs text-slate-400 font-mono">
-            <span>Personel Terdaftar: </span>
-            <div className="flex flex-wrap justify-center gap-1.5 mt-2 max-w-sm">
+          <div className="mt-8 text-center text-xs text-slate-500 font-mono">
+            <span>Akses Khusus Anggota Kembara: </span>
+            <div className="flex flex-wrap justify-center gap-2 mt-2">
               {MEMBERS.map(m => (
-                <span key={m} className="bg-white border border-slate-200/60 shadow-xs px-2.5 py-0.5 rounded-full text-slate-500 font-sans text-[11px]">
+                <span key={m} className="bg-white border border-slate-200 shadow-sm px-3 py-1 rounded-full text-slate-700 font-sans text-xs">
                   {m}
                 </span>
               ))}
@@ -473,8 +380,76 @@ function onEdit(e) {
           </div>
         </div>
 
-        <div className="text-center text-[11px] text-slate-400 font-mono mt-6">
+        <div className="text-center text-xs text-slate-400 font-mono">
           © 2026 KEMBARA MONITORING SYSTEM • CM3105
+        </div>
+      </div>
+    );
+  }
+
+  // Render Seeding Screen (if spreadsheet 'kembara 2026' does not exist in user's Drive)
+  if (!isLoadingData && token && spreadsheetId === null) {
+    return (
+      <div className="min-h-screen bg-[#F4F6FA] text-slate-800 font-sans flex items-center justify-center p-6">
+        <div className="max-w-md w-full bg-white border border-slate-200 p-8 rounded-3xl shadow-xl shadow-slate-200/50 relative overflow-hidden">
+          <div className="absolute top-0 right-0 w-32 h-32 bg-blue-500/5 rounded-full blur-3xl pointer-events-none" />
+          
+          <div className="w-16 h-16 bg-amber-50 border border-amber-200 rounded-2xl flex items-center justify-center mb-6">
+            <FileSpreadsheet className="w-8 h-8 text-amber-600 animate-pulse" />
+          </div>
+
+          <h2 className="text-2xl font-display font-bold text-slate-800 mb-1">
+            Spreadsheet Tidak Ditemukan
+          </h2>
+          <p className="text-xs text-amber-600 font-mono font-medium tracking-wider mb-4 uppercase bg-amber-50 px-2.5 py-1 rounded w-fit">
+            FILE: "kembara 2026"
+          </p>
+
+          <p className="text-slate-600 text-sm leading-relaxed mb-6 font-sans">
+            Aplikasi membutuhkan file Google Sheets bernama <strong className="text-slate-800 font-medium">"kembara 2026"</strong> di Google Drive Anda untuk menyimpan seluruh status kesiapan personal dan regu. 
+          </p>
+          
+          <div className="bg-slate-50 border border-slate-200 p-5 rounded-xl text-xs text-slate-600 space-y-2.5 mb-6">
+            <p className="font-semibold text-slate-800">Yang akan dibuat otomatis:</p>
+            <ul className="list-disc list-inside space-y-1.5 text-slate-600">
+              <li>Tab <strong className="text-blue-700">Individu</strong>: Checklist peralatan pokok & sekunder untuk 6 personel (234 baris).</li>
+              <li>Tab <strong className="text-amber-700">Regu</strong>: Checklist peralatan bersama beserta penanggung jawab (11 baris).</li>
+            </ul>
+          </div>
+
+          <button
+            onClick={handleCreateSheet}
+            disabled={initializingSpreadsheet}
+            className="w-full bg-blue-600 hover:bg-blue-700 text-white font-sans font-semibold py-3 rounded-xl transition-all shadow-lg shadow-blue-600/10 flex items-center justify-center space-x-2 cursor-pointer"
+          >
+            {initializingSpreadsheet ? (
+              <>
+                <div className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                <span>Membuat & Menginisialisasi...</span>
+              </>
+            ) : (
+              <>
+                <PlusCircle className="w-5 h-5" />
+                <span>Buat & Inisialisasi Google Sheet</span>
+              </>
+            )}
+          </button>
+
+          {error && (
+            <div className="mt-4 p-3 bg-red-50 border border-red-200 text-red-700 rounded-lg text-xs font-medium">
+              {error}
+            </div>
+          )}
+
+          <div className="mt-6 pt-4 border-t border-slate-100 text-center">
+            <button 
+              onClick={handleLogout}
+              className="text-xs font-mono text-slate-400 hover:text-blue-700 flex items-center justify-center mx-auto space-x-1 cursor-pointer"
+            >
+              <LogOut className="w-3.5 h-3.5" />
+              <span>Keluar / Ganti Akun</span>
+            </button>
+          </div>
         </div>
       </div>
     );
@@ -964,73 +939,50 @@ function onEdit(e) {
         )}
       </AnimatePresence>
 
-      {/* 5. BOTTOM GOOGLE SHEETS SYNC CONTROL FOOTER */}
-      <footer className="fixed bottom-0 left-0 right-0 z-40 bg-[#070d1e] border-t border-slate-800 text-white shadow-2xl px-4 md:px-8 py-3.5 transition-all">
-        <div className="max-w-7xl mx-auto flex flex-col md:flex-row items-center justify-between gap-4">
+      {/* 5. BOTTOM GOOGLE SHEETS CONFIGURATION DRAWER (MATCHING BOTTOM BAR EXACTLY) */}
+      <footer className="fixed bottom-0 left-0 right-0 z-40 bg-[#0a1023] border-t border-slate-800 text-white shadow-xl px-4 md:px-8 py-3.5">
+        <div className="max-w-7xl mx-auto flex flex-col md:flex-row items-center justify-between gap-3">
           
-          {/* Connection Status Indicator */}
-          <div className="flex items-center space-x-3 w-full md:w-auto">
-            {isSheetsConnected() ? (
-              <div className="w-8 h-8 bg-emerald-950 border border-emerald-500/30 rounded-xl flex items-center justify-center">
-                <CheckCircle className="w-4 h-4 text-emerald-400" />
+          {/* Config label & active status */}
+          <div className="flex flex-col md:flex-row md:items-center gap-2 text-center md:text-left">
+            <div className="flex items-center space-x-2 justify-center md:justify-start">
+              <div className="w-8 h-8 bg-blue-900/40 rounded-xl flex items-center justify-center border border-blue-700/20">
+                <FileSpreadsheet className="w-4 h-4 text-blue-400" />
               </div>
-            ) : (
-              <div className="w-8 h-8 bg-slate-900 border border-slate-700/30 rounded-xl flex items-center justify-center">
-                <FileSpreadsheet className="w-4 h-4 text-slate-400" />
-              </div>
-            )}
-            <div className="text-left">
-              <div className="flex items-center space-x-2">
-                <span className="text-xs font-sans font-extrabold text-white tracking-wide">
-                  {isSheetsConnected() ? "Sinkronisasi Google Sheets Aktif" : "Sistem Penyimpanan Lokal"}
-                </span>
-                <span className={`text-[9px] font-extrabold px-2 py-0.5 rounded-full uppercase tracking-wider font-mono ${
-                  isSheetsConnected() 
-                    ? "bg-emerald-950 border border-emerald-500/20 text-emerald-400" 
-                    : "bg-slate-900 border border-slate-700/20 text-slate-400"
-                }`}>
-                  {isSheetsConnected() ? "Live" : "Lokal"}
-                </span>
-              </div>
-              <p className="text-[10px] text-slate-400 font-sans mt-0.5">
-                {isSheetsConnected() 
-                  ? "Status kesiapan disinkronkan secara real-time dengan spreadsheet Google."
-                  : "Perubahan disimpan di browser ini. Hubungkan Google Sheets untuk kerja kelompok."
-                }
-              </p>
+              <span className="text-xs md:text-sm font-sans font-bold text-white tracking-wide block">
+                Konfigurasi Jembatan Apps Script (Real-time Google Sheets)
+              </span>
+              <span className="bg-emerald-950/80 text-emerald-400 border border-emerald-800/40 text-[9px] font-bold px-2.5 py-0.5 rounded-full flex items-center">
+                <span className="w-1.5 h-1.5 bg-emerald-500 rounded-full mr-1 animate-ping" />
+                Polling Real-time Aktif
+              </span>
             </div>
+            <p className="text-[10px] text-slate-400 max-w-2xl font-sans leading-relaxed">
+              Gunakan konfigurasi jembatan ini agar perubahan di Google Sheets langsung ter-update di dashboard secara instan dan sebaliknya.
+            </p>
           </div>
 
-          {/* Quick Buttons */}
-          <div className="flex items-center space-x-2.5 w-full md:w-auto justify-end">
+          {/* Config Switch Toggle */}
+          <div className="flex items-center space-x-3">
+            <span className="text-xs text-slate-300 font-sans font-bold">
+              Tampilkan Konfigurasi:
+            </span>
             <button
               onClick={() => setShowConfig(!showConfig)}
-              className={`px-3.5 py-1.5 rounded-xl text-xs font-bold transition-all flex items-center space-x-1.5 cursor-pointer ${
-                showConfig 
-                  ? "bg-blue-600 text-white shadow-md shadow-blue-600/10" 
-                  : "bg-slate-900 hover:bg-slate-800 text-slate-300 border border-slate-850"
+              className={`relative w-12 h-6 rounded-full p-1 transition-colors duration-250 cursor-pointer focus:outline-none ${
+                showConfig ? "bg-blue-600" : "bg-slate-700"
               }`}
             >
-              <FileSpreadsheet className="w-3.5 h-3.5" />
-              <span>{showConfig ? "Tutup Pengaturan" : "Konfigurasi Google Sheets"}</span>
-            </button>
-
-            <button
-              onClick={() => {
-                if (window.confirm("Apakah Anda yakin ingin mengatur ulang semua data checklist kembali ke setelan awal? Tindakan ini tidak dapat dibatalkan.")) {
-                  localStorage.removeItem("kembara_individual_items");
-                  localStorage.removeItem("kembara_team_items");
-                  loadAllData();
-                }
-              }}
-              className="px-3 py-1.5 bg-red-950/20 hover:bg-red-900/30 text-red-400 hover:text-red-300 rounded-xl border border-red-900/20 text-xs font-bold transition-all cursor-pointer"
-            >
-              Atur Ulang
+              <div
+                className={`w-4 h-4 bg-white rounded-full shadow-md transform transition-transform duration-250 ${
+                  showConfig ? "translate-x-6" : "translate-x-0"
+                }`}
+              />
             </button>
           </div>
         </div>
 
-        {/* Toggled Settings & Integration Drawer */}
+        {/* Toggled Apps Script Setup instructions drawer */}
         <AnimatePresence>
           {showConfig && (
             <motion.div
@@ -1039,161 +991,55 @@ function onEdit(e) {
               exit={{ opacity: 0, height: 0 }}
               className="max-w-7xl mx-auto overflow-hidden mt-4 pt-4 border-t border-slate-800"
             >
-              <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 text-xs text-slate-300 pb-4">
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-6 text-xs text-slate-300 pb-4">
                 
-                {/* Form to connect Web App URL */}
-                <div className="lg:col-span-5 space-y-4 bg-slate-950/50 p-5 rounded-2xl border border-slate-850/60 flex flex-col justify-between">
-                  <div className="space-y-3">
-                    <h4 className="font-extrabold text-[#00d2ff] uppercase font-mono tracking-wider text-[10px] flex items-center">
-                      <span className="w-1.5 h-1.5 bg-[#00d2ff] rounded-full mr-2 animate-pulse" />
-                      1. Hubungkan Google Apps Script Web App
-                    </h4>
-                    <p className="text-slate-400 leading-relaxed text-[11px]">
-                      Tempel URL Web App dari Google Apps Script yang Anda deploy di Google Sheet Anda untuk mengaktifkan database real-time.
-                    </p>
-
-                    <div className="space-y-1.5">
-                      <label className="block text-[10px] font-bold text-slate-500 uppercase tracking-wider font-mono">
-                        URL Web App Apps Script:
-                      </label>
-                      <input
-                        type="url"
-                        value={appsScriptUrlInput}
-                        onChange={(e) => setAppsScriptUrlInput(e.target.value)}
-                        placeholder="https://script.google.com/macros/s/xxxxxxxx/exec"
-                        className="w-full bg-slate-900 border border-slate-800 hover:border-slate-700 focus:border-blue-500 focus:bg-slate-900/80 text-xs px-3.5 py-2.5 rounded-xl outline-none transition-all duration-200 text-white font-mono"
-                      />
+                {/* Spreadsheet Info */}
+                <div className="space-y-3 bg-slate-950/40 p-4 rounded-xl border border-slate-850">
+                  <h4 className="font-extrabold text-[#00d2ff] uppercase font-mono tracking-wider">
+                    SINKRONISASI AKTIF:
+                  </h4>
+                  <div className="space-y-2">
+                    <div>
+                      <span className="text-slate-400 block text-[9px] font-mono uppercase tracking-wider">Nama Spreadsheet:</span>
+                      <strong className="text-white font-sans text-sm block">"kembara 2026"</strong>
                     </div>
-                  </div>
-
-                  <div className="flex flex-col sm:flex-row gap-2 mt-4">
-                    <button
-                      onClick={() => {
-                        if (!appsScriptUrlInput.trim().startsWith("https://script.google.com/")) {
-                          alert("Harap masukkan URL Google Apps Script Web App yang valid.");
-                          return;
-                        }
-                        setAppsScriptUrl(appsScriptUrlInput);
-                        loadAllData();
-                      }}
-                      className="flex-1 bg-blue-600 hover:bg-blue-700 text-white font-sans font-bold text-xs py-2.5 rounded-xl shadow-md transition-all flex items-center justify-center space-x-1.5 cursor-pointer"
-                    >
-                      <Check className="w-4 h-4" />
-                      <span>Simpan & Sambungkan</span>
-                    </button>
-
-                    {isSheetsConnected() && (
-                      <button
-                        onClick={() => {
-                          if (window.confirm("Putuskan koneksi dari Google Sheets dan kembali ke penyimpanan lokal?")) {
-                            setAppsScriptUrl("");
-                            setAppsScriptUrlInput("");
-                            loadAllData();
-                          }
-                        }}
-                        className="px-3.5 py-2.5 bg-slate-900 hover:bg-slate-850 text-slate-400 hover:text-white rounded-xl border border-slate-800 text-xs font-bold transition-all cursor-pointer"
+                    <div>
+                      <span className="text-slate-400 block text-[9px] font-mono uppercase tracking-wider">ID Spreadsheet Google Drive:</span>
+                      <code className="text-[#00d2ff] font-mono text-xs select-all bg-slate-900 p-1.5 rounded border border-slate-800 block truncate mt-1">
+                        {spreadsheetId}
+                      </code>
+                    </div>
+                    {spreadsheetId && (
+                      <a
+                        href={`https://docs.google.com/spreadsheets/d/${spreadsheetId}/edit`}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="inline-flex items-center space-x-1.5 text-xs text-white bg-blue-600 hover:bg-blue-700 font-semibold px-3 py-1.5 rounded-lg shadow transition-all mt-2 cursor-pointer"
                       >
-                        Putuskan
-                      </button>
+                        <span>Buka Google Sheets</span>
+                        <ExternalLink className="w-3 h-3" />
+                      </a>
                     )}
                   </div>
                 </div>
 
-                {/* Automation Seeding / Init Control if connected */}
-                <div className="lg:col-span-7 space-y-4 bg-slate-950/50 p-5 rounded-2xl border border-slate-850/60">
-                  <h4 className="font-extrabold text-[#00d2ff] uppercase font-mono tracking-wider text-[10px] flex items-center justify-between">
-                    <span>2. Setup & Sinkronisasi Spreadsheet</span>
-                    {isSheetsConnected() && (
-                      <span className="text-emerald-400 font-sans font-bold text-[10px] bg-emerald-950/80 px-2 py-0.5 rounded-full border border-emerald-800/40">
-                        SINKRON
-                      </span>
-                    )}
-                  </h4>
-
-                  <div className="space-y-3">
-                    <div className="bg-slate-900 p-3 rounded-xl border border-slate-800/80 text-[11px] text-slate-300">
-                      <p className="font-bold text-white mb-1">Target Google Sheets:</p>
-                      <a 
-                        href="https://docs.google.com/spreadsheets/d/1JVHphy4wCj-NwrxeYNLPecXHat9c7mozGf8DkOaryRQ/edit?usp=sharing"
-                        target="_blank" 
-                        rel="noreferrer" 
-                        className="text-[#00d2ff] underline font-mono break-all hover:text-blue-400 flex items-center space-x-1"
-                      >
-                        <span>https://docs.google.com/spreadsheets/d/1JVHphy4wCj-NwrxeYNLPecXHat9c7mozGf8DkOaryRQ/...</span>
-                        <ExternalLink className="w-3 h-3 inline flex-shrink-0" />
-                      </a>
-                    </div>
-
-                    <div className="space-y-2">
-                      <p className="text-slate-400 leading-relaxed text-[11px]">
-                        Gunakan tombol di bawah ini untuk menginisialisasi atau mengatur ulang struktur kolom tab <strong className="text-white">"Individu"</strong> dan <strong className="text-white">"Regu"</strong> langsung di Google Sheets Anda secara otomatis jika sheet Anda masih kosong.
-                      </p>
-
-                      <div className="flex flex-col sm:flex-row gap-2.5">
-                        <button
-                          disabled={!isSheetsConnected() || isInitializingSheet}
-                          onClick={async () => {
-                            if (!window.confirm("Tindakan ini akan membuat/mengatur ulang tab 'Individu' dan 'Regu' di Google Sheet Target Anda. Seluruh data di sheet tersebut akan digantikan dengan template default Kembara. Apakah Anda yakin ingin melanjutkan?")) {
-                              return;
-                            }
-                            setIsInitializingSheet(true);
-                            setError(null);
-                            try {
-                              const url = getAppsScriptUrl();
-                              if (url) {
-                                await initializeSheetsOnSpreadsheet(url);
-                                alert("Berhasil menginisialisasi Google Sheet! Tab 'Individu' dan 'Regu' telah dibuat & diisi.");
-                                loadAllData();
-                              }
-                            } catch (err: any) {
-                              console.error("Failed to initialize sheet:", err);
-                              alert("Gagal menginisialisasi Google Sheet: " + (err.message || err));
-                            } finally {
-                              setIsInitializingSheet(false);
-                            }
-                          }}
-                          className={`flex-1 font-sans font-bold text-xs py-2.5 rounded-xl shadow-md transition-all flex items-center justify-center space-x-1.5 ${
-                            isSheetsConnected() 
-                              ? "bg-amber-600 hover:bg-amber-700 text-white cursor-pointer" 
-                              : "bg-slate-900 text-slate-500 border border-slate-850 cursor-not-allowed"
-                          }`}
-                        >
-                          {isInitializingSheet ? (
-                            <>
-                              <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                              <span>Menginisialisasi Kolom...</span>
-                            </>
-                          ) : (
-                            <>
-                              <PlusCircle className="w-3.5 h-3.5" />
-                              <span>Inisialisasi Struktur Google Sheet</span>
-                            </>
-                          )}
-                        </button>
-
-                        <button
-                          onClick={() => {
-                            const code = getGeneratedAppsScriptCode("1JVHphy4wCj-NwrxeYNLPecXHat9c7mozGf8DkOaryRQ");
-                            navigator.clipboard.writeText(code);
-                            setCopiedScript(true);
-                            setTimeout(() => setCopiedScript(false), 2000);
-                          }}
-                          className="px-4 py-2.5 bg-slate-900 hover:bg-slate-850 text-slate-200 hover:text-white rounded-xl border border-slate-800 text-xs font-bold transition-all flex items-center justify-center space-x-1.5 cursor-pointer"
-                        >
-                          {copiedScript ? <Check className="w-4 h-4 text-emerald-400" /> : <Copy className="w-4 h-4" />}
-                          <span>{copiedScript ? "Kode Tersalin!" : "Salin Kode Apps Script"}</span>
-                        </button>
-                      </div>
-                    </div>
-
-                    <div className="pt-2 text-[10px] text-slate-400 leading-relaxed space-y-1">
-                      <p className="font-extrabold text-slate-300">Cara Penggunaan (3 Langkah Cepat):</p>
-                      <p>1. Klik <strong className="text-white">"Salin Kode Apps Script"</strong> di atas.</p>
-                      <p>2. Buka spreadsheet Anda, klik <strong className="text-white">Ekstensi &rarr; Apps Script</strong>, hapus kode bawaan, tempel kode tadi, klik simpan.</p>
-                      <p>3. Klik <strong className="text-white">Terapkan (Deploy) &rarr; Penerapan baru</strong>, pilih <strong className="text-white">Aplikasi Web</strong>, set Akses ke <strong className="text-white">"Siapa saja" (Anyone)</strong>, klik Terapkan, salin URL-nya dan tempel di formulir di kiri.</p>
-                    </div>
-
+                {/* Google Apps Script Integration instructions */}
+                <div className="space-y-3 bg-slate-950/40 p-4 rounded-xl border border-slate-850">
+                  <div className="flex justify-between items-center">
+                    <h4 className="font-extrabold text-[#00d2ff] uppercase font-mono tracking-wider">
+                      SETUP AUTOMATION (APPS SCRIPT):
+                    </h4>
+                    <button
+                      onClick={copyAppsScript}
+                      className="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-200 hover:text-white rounded flex items-center space-x-1 transition-all cursor-pointer"
+                    >
+                      {copiedScript ? <Check className="w-3 h-3 text-emerald-400" /> : <Copy className="w-3 h-3" />}
+                      <span>{copiedScript ? "Tersalin!" : "Salin Kode"}</span>
+                    </button>
                   </div>
+                  <p className="text-slate-400 leading-relaxed text-[11px]">
+                    Agar setiap kali Anda mencentang barang langsung dari Google Sheets ter-update di dashboard ini secara instan, buka spreadsheet Anda, klik <strong className="text-white">Ekstensi &rarr; Apps Script</strong>, paste kode yang disalin di sana, lalu simpan.
+                  </p>
                 </div>
 
               </div>

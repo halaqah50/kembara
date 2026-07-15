@@ -1,83 +1,201 @@
 import { IndividualItem, TeamItem, INDIVIDUAL_ITEMS_TEMPLATE, TEAM_ITEMS_TEMPLATE, MEMBERS } from "../types";
 
-const APPS_SCRIPT_URL_KEY = "kembara_apps_script_url";
-const DEFAULT_APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbxOAX5p_n_o6wVXHn_dPZtVPdh0SxH3tFp1wElpIdRz6nzA75hZodnhkHJCZ9ss10P_/exec";
-
 /**
- * Gets the configured Google Apps Script Web App URL from localStorage.
+ * Searches for a spreadsheet named 'kembara 2026' in Google Drive.
+ * Returns the spreadsheet ID if found, otherwise returns null.
  */
-export function getAppsScriptUrl(): string | null {
-  const url = localStorage.getItem(APPS_SCRIPT_URL_KEY);
-  if (url === null) {
-    return DEFAULT_APPS_SCRIPT_URL;
-  }
-  return url || null;
-}
-
-/**
- * Saves the Google Apps Script Web App URL to localStorage.
- */
-export function setAppsScriptUrl(url: string): void {
-  if (url) {
-    localStorage.setItem(APPS_SCRIPT_URL_KEY, url.trim());
-  } else {
-    // Save empty string to represent explicit disconnection
-    localStorage.setItem(APPS_SCRIPT_URL_KEY, "");
-  }
-}
-
-/**
- * Checks if the application is connected to a Google Sheets Apps Script bridge.
- */
-export function isSheetsConnected(): boolean {
-  const url = getAppsScriptUrl();
-  return !!url && url.startsWith("https://script.google.com/");
-}
-
-/**
- * Fetches all individual and team checklist items from Google Sheets.
- */
-export async function readSheetsData(webAppUrl: string): Promise<{
-  individualData: IndividualItem[];
-  teamData: TeamItem[];
-}> {
+export async function findSpreadsheet(accessToken: string): Promise<string | null> {
+  const query = encodeURIComponent("name = 'kembara 2026' and mimeType = 'application/vnd.google-apps.spreadsheet' and trashed = false");
+  const url = `https://www.googleapis.com/drive/v3/files?q=${query}&fields=files(id,name)`;
+  
   try {
-    // Standard Apps Script doGet returns the JSON payload
-    // Removing custom headers to prevent any preflight CORS checks!
-    const res = await fetch(webAppUrl, {
-      method: "GET",
-      mode: "cors"
+    const res = await fetch(url, {
+      headers: { Authorization: `Bearer ${accessToken}` },
     });
-
-    if (!res.ok) {
-      throw new Error(`Koneksi HTTP gagal: ${res.status} ${res.statusText}`);
-    }
-
-    const text = await res.text();
-    const cleanText = text.trim();
     
-    // Check if the response is HTML instead of JSON (which indicates error / authorization page)
-    if (cleanText.startsWith("<!DOCTYPE html") || cleanText.startsWith("<html") || cleanText.startsWith("<script") || cleanText.includes("Google Accounts")) {
-      throw new Error("Apps Script mengembalikan halaman otorisasi/login (HTML). Pastikan opsi 'Who has access' diatur ke 'Anyone' (Siapa Saja) saat menerbitkan Web App (Deploy) di Apps Script dan Anda sudah menekan 'Authorize Access'.");
+    if (!res.ok) {
+      throw new Error(`Failed to search Drive: ${res.statusText}`);
     }
-
-    let data;
-    try {
-      data = JSON.parse(cleanText);
-    } catch (parseError) {
-      throw new Error("Gagal mengurai data JSON dari Google Sheets. Pastikan skrip Google Apps Script telah disalin dan ditempel dengan benar di Extensions -> Apps Script.");
+    
+    const data = await res.json();
+    if (data.files && data.files.length > 0) {
+      return data.files[0].id;
     }
+    return null;
+  } catch (error) {
+    console.error("Error finding spreadsheet:", error);
+    throw error;
+  }
+}
 
-    if (data.status === "error") {
-      throw new Error(data.message || "Unknown Apps Script error");
+/**
+ * Creates a new spreadsheet named 'kembara 2026' with two sheets: 'Individu' and 'Regu'.
+ * Populates them with headers and default items for all 6 members.
+ */
+export async function createAndInitializeSpreadsheet(accessToken: string): Promise<string> {
+  const url = "https://sheets.googleapis.com/v4/spreadsheets";
+  
+  try {
+    // 1. Create spreadsheet with custom sheets
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        properties: { title: "kembara 2026" },
+        sheets: [
+          { properties: { title: "Individu" } },
+          { properties: { title: "Regu" } },
+        ],
+      }),
+    });
+    
+    if (!res.ok) {
+      const errorBody = await res.text();
+      throw new Error(`Failed to create spreadsheet: ${res.statusText} - ${errorBody}`);
     }
+    
+    const spreadsheet = await res.json();
+    const spreadsheetId = spreadsheet.spreadsheetId;
+    
+    // 2. Prepare Individu sheet data
+    const individuRows: any[][] = [
+      ["User", "Category", "Subcategory", "Item Name", "Status", "Notes", "Last Updated"]
+    ];
+    
+    for (const member of MEMBERS) {
+      for (const item of INDIVIDUAL_ITEMS_TEMPLATE) {
+        individuRows.push([
+          member,
+          item.category,
+          item.subcategory,
+          item.itemName,
+          "FALSE",
+          "",
+          ""
+        ]);
+      }
+    }
+    
+    // 3. Prepare Regu sheet data
+    const reguRows: any[][] = [
+      ["Item Name", "Status", "PIC", "Notes", "Last Updated"]
+    ];
+    
+    for (const item of TEAM_ITEMS_TEMPLATE) {
+      reguRows.push([
+        item.itemName,
+        "FALSE",
+        "Belum Ada",
+        item.notes,
+        ""
+      ]);
+    }
+    
+    // 4. Batch update sheets with the data
+    const batchUpdateUrl = `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values:batchUpdate`;
+    const batchRes = await fetch(batchUpdateUrl, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        valueInputOption: "USER_ENTERED",
+        data: [
+          {
+            range: "Individu!A1",
+            values: individuRows,
+          },
+          {
+            range: "Regu!A1",
+            values: reguRows,
+          }
+        ]
+      }),
+    });
+    
+    if (!batchRes.ok) {
+      throw new Error(`Failed to populate spreadsheet: ${batchRes.statusText}`);
+    }
+    
+    return spreadsheetId;
+  } catch (error) {
+    console.error("Error creating and initializing spreadsheet:", error);
+    throw error;
+  }
+}
 
-    return {
-      individualData: data.individualData || [],
-      teamData: data.teamData || [],
-    };
-  } catch (error: any) {
-    console.error("Error reading sheets data via Apps Script:", error);
+/**
+ * Reads all individual items from the spreadsheet.
+ */
+export async function readIndividualItems(accessToken: string, spreadsheetId: string): Promise<IndividualItem[]> {
+  const range = "Individu!A2:G300"; // up to 300 rows (6 * 39 = 234 rows)
+  const url = `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${range}`;
+  
+  try {
+    const res = await fetch(url, {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+    
+    if (!res.ok) {
+      throw new Error(`Failed to read individual sheet: ${res.statusText}`);
+    }
+    
+    const data = await res.json();
+    const rows = data.values || [];
+    
+    return rows.map((row: any[], index: number) => {
+      return {
+        user: row[0] || "",
+        category: (row[1] as "Pokok" | "Sekunder") || "Pokok",
+        subcategory: row[2] || "",
+        itemName: row[3] || "",
+        status: row[4] === "TRUE",
+        notes: row[5] || "",
+        lastUpdated: row[6] || "",
+        rowIndex: index + 2, // Row index is 1-based, and row index 1 is header, so row starts at index 2
+      };
+    });
+  } catch (error) {
+    console.error("Error reading individual items:", error);
+    throw error;
+  }
+}
+
+/**
+ * Reads all team items from the spreadsheet.
+ */
+export async function readTeamItems(accessToken: string, spreadsheetId: string): Promise<TeamItem[]> {
+  const range = "Regu!A2:E50"; // up to 50 rows (11 template rows)
+  const url = `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${range}`;
+  
+  try {
+    const res = await fetch(url, {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+    
+    if (!res.ok) {
+      throw new Error(`Failed to read team sheet: ${res.statusText}`);
+    }
+    
+    const data = await res.json();
+    const rows = data.values || [];
+    
+    return rows.map((row: any[], index: number) => {
+      return {
+        itemName: row[0] || "",
+        status: row[1] === "TRUE",
+        pic: row[2] || "Belum Ada",
+        notes: row[3] || "",
+        lastUpdated: row[4] || "",
+        rowIndex: index + 2, // starts at row 2
+      };
+    });
+  } catch (error) {
+    console.error("Error reading team items:", error);
     throw error;
   }
 }
@@ -85,33 +203,43 @@ export async function readSheetsData(webAppUrl: string): Promise<{
 /**
  * Updates a single individual item row in the spreadsheet.
  */
-export async function updateIndividualItemOnSheet(
-  webAppUrl: string,
+export async function updateIndividualItem(
+  accessToken: string,
+  spreadsheetId: string,
   item: IndividualItem
 ): Promise<void> {
+  if (item.rowIndex === undefined) {
+    throw new Error("rowIndex is required to update individual item");
+  }
+  
+  const range = `Individu!A${item.rowIndex}:G${item.rowIndex}`;
+  const url = `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${range}?valueInputOption=USER_ENTERED`;
+  
   try {
-    const res = await fetch(webAppUrl, {
-      method: "POST",
-      mode: "cors",
+    const res = await fetch(url, {
+      method: "PUT",
       headers: {
-        "Content-Type": "text/plain;charset=utf-8", // text/plain avoids preflight CORS checks in some legacy envs
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        action: "updateIndividual",
-        item: item,
+        values: [[
+          item.user,
+          item.category,
+          item.subcategory,
+          item.itemName,
+          item.status ? "TRUE" : "FALSE",
+          item.notes,
+          item.lastUpdated
+        ]]
       }),
     });
-
+    
     if (!res.ok) {
-      throw new Error(`Failed to update individual item on Sheet: ${res.statusText}`);
-    }
-
-    const result = await res.json();
-    if (result.status === "error") {
-      throw new Error(result.message || "Apps Script rejected individual update");
+      throw new Error(`Failed to update individual item: ${res.statusText}`);
     }
   } catch (error) {
-    console.error("Error updating individual item on Sheet:", error);
+    console.error("Error updating individual item:", error);
     throw error;
   }
 }
@@ -119,262 +247,41 @@ export async function updateIndividualItemOnSheet(
 /**
  * Updates a single team item row in the spreadsheet.
  */
-export async function updateTeamItemOnSheet(
-  webAppUrl: string,
+export async function updateTeamItem(
+  accessToken: string,
+  spreadsheetId: string,
   item: TeamItem
 ): Promise<void> {
+  if (item.rowIndex === undefined) {
+    throw new Error("rowIndex is required to update team item");
+  }
+  
+  const range = `Regu!A${item.rowIndex}:E${item.rowIndex}`;
+  const url = `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${range}?valueInputOption=USER_ENTERED`;
+  
   try {
-    const res = await fetch(webAppUrl, {
-      method: "POST",
-      mode: "cors",
+    const res = await fetch(url, {
+      method: "PUT",
       headers: {
-        "Content-Type": "text/plain;charset=utf-8",
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        action: "updateTeam",
-        item: item,
+        values: [[
+          item.itemName,
+          item.status ? "TRUE" : "FALSE",
+          item.pic,
+          item.notes,
+          item.lastUpdated
+        ]]
       }),
     });
-
+    
     if (!res.ok) {
-      throw new Error(`Failed to update team item on Sheet: ${res.statusText}`);
-    }
-
-    const result = await res.json();
-    if (result.status === "error") {
-      throw new Error(result.message || "Apps Script rejected team update");
+      throw new Error(`Failed to update team item: ${res.statusText}`);
     }
   } catch (error) {
-    console.error("Error updating team item on Sheet:", error);
+    console.error("Error updating team item:", error);
     throw error;
   }
-}
-
-/**
- * Initializes the target Google Sheet with headers and all templates.
- */
-export async function initializeSheetsOnSpreadsheet(webAppUrl: string): Promise<void> {
-  try {
-    const res = await fetch(webAppUrl, {
-      method: "POST",
-      mode: "cors",
-      headers: {
-        "Content-Type": "text/plain;charset=utf-8",
-      },
-      body: JSON.stringify({
-        action: "initializeSheets",
-        members: MEMBERS,
-        indTemplate: INDIVIDUAL_ITEMS_TEMPLATE,
-        teamTemplate: TEAM_ITEMS_TEMPLATE,
-      }),
-    });
-
-    if (!res.ok) {
-      throw new Error(`Failed to initialize Google Sheet: ${res.statusText}`);
-    }
-
-    const result = await res.json();
-    if (result.status === "error") {
-      throw new Error(result.message || "Apps Script rejected sheet initialization");
-    }
-  } catch (error) {
-    console.error("Error initializing Sheet:", error);
-    throw error;
-  }
-}
-
-/**
- * Generated Google Apps Script code that the user needs to paste into their sheet's Apps Script editor.
- */
-export function getGeneratedAppsScriptCode(spreadsheetId: string): string {
-  return `/**
- * GOOGLE APPS SCRIPT WEB APP FOR KEMBARA MONITORING SYSTEM (CM3105)
- * 
- * SPREADSHEET TARGET:
- * https://docs.google.com/spreadsheets/d/${spreadsheetId}/edit
- * 
- * INSTRUCTIONS:
- * 1. Open your Google Sheet
- * 2. Click Extensions -> Apps Script
- * 3. Delete any default code in Code.gs
- * 4. Paste this entire code block
- * 5. Click Save (Disk icon)
- * 6. Click Deploy -> New deployment
- * 7. Choose type: "Web app"
- * 8. Set Configuration:
- *    - Description: "Kembara Realtime Sync"
- *    - Execute as: "Me" (your-email@gmail.com)
- *    - Who has access: "Anyone" (crucial!)
- * 9. Click Deploy, Authorize access, and copy the generated Web App URL!
- * 10. Paste the URL into Kembara Monitoring configuration panel.
- */
-
-const SPREADSHEET_ID = "${spreadsheetId}";
-
-function doGet(e) {
-  const originHeader = e && e.parameter && e.parameter.origin;
-  const headers = {
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type"
-  };
-
-  try {
-    const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
-    
-    // Read Tab: Individu
-    const sheetIndividu = ss.getSheetByName("Individu");
-    let individualData = [];
-    if (sheetIndividu) {
-      const rows = sheetIndividu.getDataRange().getValues();
-      // Skip headers (row 0)
-      for (let i = 1; i < rows.length; i++) {
-        const row = rows[i];
-        if (!row[0]) continue; // Skip empty rows
-        individualData.push({
-          user: String(row[0] || ""),
-          category: String(row[1] || "Pokok"),
-          subcategory: String(row[2] || ""),
-          itemName: String(row[3] || ""),
-          status: row[4] === true || String(row[4]).toUpperCase() === "TRUE" || row[4] === 1,
-          notes: String(row[5] || ""),
-          lastUpdated: String(row[6] || ""),
-          rowIndex: i + 1
-        });
-      }
-    }
-    
-    // Read Tab: Regu
-    const sheetRegu = ss.getSheetByName("Regu");
-    let teamData = [];
-    if (sheetRegu) {
-      const rows = sheetRegu.getDataRange().getValues();
-      // Skip headers (row 0)
-      for (let i = 1; i < rows.length; i++) {
-        const row = rows[i];
-        if (!row[0]) continue; // Skip empty rows
-        teamData.push({
-          itemName: String(row[0] || ""),
-          status: row[1] === true || String(row[1]).toUpperCase() === "TRUE" || row[1] === 1,
-          pic: String(row[2] || "Belum Ada"),
-          notes: String(row[3] || ""),
-          lastUpdated: String(row[4] || ""),
-          rowIndex: i + 1
-        });
-      }
-    }
-    
-    const output = JSON.stringify({
-      status: "success",
-      individualData: individualData,
-      teamData: teamData
-    });
-
-    return ContentService.createTextOutput(output)
-      .setMimeType(ContentService.MimeType.JSON);
-    
-  } catch (err) {
-    const errorOutput = JSON.stringify({
-      status: "error",
-      message: err.toString()
-    });
-    return ContentService.createTextOutput(errorOutput)
-      .setMimeType(ContentService.MimeType.JSON);
-  }
-}
-
-function doPost(e) {
-  try {
-    const postData = JSON.parse(e.postData.contents);
-    const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
-    const action = postData.action;
-    
-    if (action === "updateIndividual") {
-      const sheet = ss.getSheetByName("Individu");
-      if (!sheet) throw new Error("Sheet 'Individu' not found");
-      
-      const item = postData.item;
-      const rIdx = item.rowIndex;
-      
-      // Update specific row: User, Category, Subcategory, Item Name, Status, Notes, Last Updated
-      sheet.getRange(rIdx, 1, 1, 7).setValues([[
-        item.user,
-        item.category,
-        item.subcategory,
-        item.itemName,
-        item.status ? "TRUE" : "FALSE",
-        item.notes || "",
-        item.lastUpdated || ""
-      ]]);
-      
-      return ContentService.createTextOutput(JSON.stringify({ status: "success" }))
-        .setMimeType(ContentService.MimeType.JSON);
-    }
-    
-    if (action === "updateTeam") {
-      const sheet = ss.getSheetByName("Regu");
-      if (!sheet) throw new Error("Sheet 'Regu' not found");
-      
-      const item = postData.item;
-      const rIdx = item.rowIndex;
-      
-      // Update specific row: Item Name, Status, PIC, Notes, Last Updated
-      sheet.getRange(rIdx, 1, 1, 5).setValues([[
-        item.itemName,
-        item.status ? "TRUE" : "FALSE",
-        item.pic || "Belum Ada",
-        item.notes || "",
-        item.lastUpdated || ""
-      ]]);
-      
-      return ContentService.createTextOutput(JSON.stringify({ status: "success" }))
-        .setMimeType(ContentService.MimeType.JSON);
-    }
-
-    if (action === "initializeSheets") {
-      // Initialize or seed sheets if they are empty
-      let sheetIndividu = ss.getSheetByName("Individu");
-      if (!sheetIndividu) {
-        sheetIndividu = ss.insertSheet("Individu");
-      }
-      sheetIndividu.clear();
-      sheetIndividu.appendRow(["User", "Category", "Subcategory", "Item Name", "Status", "Notes", "Last Updated"]);
-      
-      const members = postData.members;
-      const indTemplate = postData.indTemplate;
-      
-      let rowsToAppend = [];
-      members.forEach(m => {
-        indTemplate.forEach(t => {
-          rowsToAppend.push([m, t.category, t.subcategory, t.itemName, "FALSE", "", ""]);
-        });
-      });
-      sheetIndividu.getRange(2, 1, rowsToAppend.length, 7).setValues(rowsToAppend);
-      
-      let sheetRegu = ss.getSheetByName("Regu");
-      if (!sheetRegu) {
-        sheetRegu = ss.insertSheet("Regu");
-      }
-      sheetRegu.clear();
-      sheetRegu.appendRow(["Item Name", "Status", "PIC", "Notes", "Last Updated"]);
-      
-      let teamRows = [];
-      postData.teamTemplate.forEach(t => {
-        teamRows.push([t.itemName, "FALSE", "Belum Ada", t.notes || "", ""]);
-      });
-      sheetRegu.getRange(2, 1, teamRows.length, 5).setValues(teamRows);
-      
-      return ContentService.createTextOutput(JSON.stringify({ status: "success" }))
-        .setMimeType(ContentService.MimeType.JSON);
-    }
-    
-    throw new Error("Invalid action: " + action);
-    
-  } catch (err) {
-    return ContentService.createTextOutput(JSON.stringify({
-      status: "error",
-      message: err.toString()
-    })).setMimeType(ContentService.MimeType.JSON);
-  }
-}`;
 }
