@@ -200,7 +200,7 @@ export default function App() {
       }
     } catch (err: any) {
       console.error("Live sync failed on load:", err);
-      setError("Gagal menyinkronkan dengan Google Sheets (Live). Menggunakan data lokal.");
+      setError(`Gagal menyinkronkan dengan Google Sheets (Live): ${err.message || "Pastikan koneksi internet aktif dan URL Apps Script benar"}. Menggunakan data lokal.`);
       setSyncStatus("error");
     } finally {
       setIsLoadingData(false);

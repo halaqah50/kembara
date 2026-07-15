@@ -1,12 +1,17 @@
 import { IndividualItem, TeamItem, INDIVIDUAL_ITEMS_TEMPLATE, TEAM_ITEMS_TEMPLATE, MEMBERS } from "../types";
 
 const APPS_SCRIPT_URL_KEY = "kembara_apps_script_url";
+const DEFAULT_APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbxOAX5p_n_o6wVXHn_dPZtVPdh0SxH3tFp1wElpIdRz6nzA75hZodnhkHJCZ9ss10P_/exec";
 
 /**
  * Gets the configured Google Apps Script Web App URL from localStorage.
  */
 export function getAppsScriptUrl(): string | null {
-  return localStorage.getItem(APPS_SCRIPT_URL_KEY);
+  const url = localStorage.getItem(APPS_SCRIPT_URL_KEY);
+  if (url === null) {
+    return DEFAULT_APPS_SCRIPT_URL;
+  }
+  return url || null;
 }
 
 /**
@@ -16,7 +21,8 @@ export function setAppsScriptUrl(url: string): void {
   if (url) {
     localStorage.setItem(APPS_SCRIPT_URL_KEY, url.trim());
   } else {
-    localStorage.removeItem(APPS_SCRIPT_URL_KEY);
+    // Save empty string to represent explicit disconnection
+    localStorage.setItem(APPS_SCRIPT_URL_KEY, "");
   }
 }
 
@@ -37,19 +43,31 @@ export async function readSheetsData(webAppUrl: string): Promise<{
 }> {
   try {
     // Standard Apps Script doGet returns the JSON payload
+    // Removing custom headers to prevent any preflight CORS checks!
     const res = await fetch(webAppUrl, {
       method: "GET",
-      mode: "cors",
-      headers: {
-        "Accept": "application/json",
-      },
+      mode: "cors"
     });
 
     if (!res.ok) {
-      throw new Error(`Failed to fetch from Apps Script: ${res.statusText}`);
+      throw new Error(`Koneksi HTTP gagal: ${res.status} ${res.statusText}`);
     }
 
-    const data = await res.json();
+    const text = await res.text();
+    const cleanText = text.trim();
+    
+    // Check if the response is HTML instead of JSON (which indicates error / authorization page)
+    if (cleanText.startsWith("<!DOCTYPE html") || cleanText.startsWith("<html") || cleanText.startsWith("<script") || cleanText.includes("Google Accounts")) {
+      throw new Error("Apps Script mengembalikan halaman otorisasi/login (HTML). Pastikan opsi 'Who has access' diatur ke 'Anyone' (Siapa Saja) saat menerbitkan Web App (Deploy) di Apps Script dan Anda sudah menekan 'Authorize Access'.");
+    }
+
+    let data;
+    try {
+      data = JSON.parse(cleanText);
+    } catch (parseError) {
+      throw new Error("Gagal mengurai data JSON dari Google Sheets. Pastikan skrip Google Apps Script telah disalin dan ditempel dengan benar di Extensions -> Apps Script.");
+    }
+
     if (data.status === "error") {
       throw new Error(data.message || "Unknown Apps Script error");
     }
@@ -58,7 +76,7 @@ export async function readSheetsData(webAppUrl: string): Promise<{
       individualData: data.individualData || [],
       teamData: data.teamData || [],
     };
-  } catch (error) {
+  } catch (error: any) {
     console.error("Error reading sheets data via Apps Script:", error);
     throw error;
   }
